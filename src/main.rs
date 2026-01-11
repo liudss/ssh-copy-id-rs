@@ -44,11 +44,16 @@ fn main() -> Result<()> {
     println!("Target: {}", args.destination);
 
     // 3. Construct the remote command
-    // We use a robust command sequence similar to the original script:
+    // We use a robust command sequence:
     // - umask 077: ensures created files are private
-    // - mkdir -p .ssh: ensures the dir exists
-    // - cat >> .ssh/authorized_keys: appends stdin to the file
-    let remote_cmd = "umask 077; test -d .ssh || mkdir .ssh ; cat >> .ssh/authorized_keys || exit 1";
+    // - mkdir -p .ssh && chmod 700 .ssh: ensures the dir exists with right perms
+    // - grep -qxF: checks if the exact key line already exists
+    let remote_cmd = "umask 077; mkdir -p .ssh && chmod 700 .ssh; \
+                      if [ ! -f .ssh/authorized_keys ]; then touch .ssh/authorized_keys && chmod 600 .ssh/authorized_keys; fi; \
+                      key=$(cat); \
+                      if ! grep -qxF \"$key\" .ssh/authorized_keys; then \
+                        echo \"$key\" >> .ssh/authorized_keys; \
+                      fi";
 
     // 4. Execute SSH
     let mut command = Command::new("ssh");
@@ -92,7 +97,13 @@ fn main() -> Result<()> {
 }
 
 fn resolve_identity_file(input: Option<String>) -> Result<PathBuf> {
-    if let Some(path_str) = input {
+    if let Some(mut path_str) = input {
+        // Expand ~ to home directory
+        if path_str.starts_with("~/") || path_str.starts_with("~\\") {
+            let home = dirs::home_dir().context("Could not determine home directory for ~ expansion")?;
+            path_str = path_str.replacen('~', &home.to_string_lossy(), 1);
+        }
+
         // If the user provided a path, check if it's the public key or private key
         let path = PathBuf::from(&path_str);
         if path.exists() {
