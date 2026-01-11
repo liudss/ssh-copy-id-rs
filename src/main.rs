@@ -22,48 +22,52 @@ struct Args {
     destination: String,
 }
 
+struct Identity {
+    /// Description of the source (e.g., file path or "ssh-agent")
+    source: String,
+    /// The actual public key content
+    content: String,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Locate the public key
-    let pub_key_path = resolve_identity_file(args.identity_file)?;
-    println!("Source: {}", pub_key_path.display());
-
-    // 2. Read the public key content
-    let key_content = fs::read_to_string(&pub_key_path)
-        .with_context(|| format!("Failed to read identity file: {:?}", pub_key_path))?;
+    // 1. Resolve identity (file or ssh-agent)
+    let identity = resolve_identity(args.identity_file)?;
+    println!("Source: {}", identity.source);
 
     // Basic validation to ensure we are sending a public key
-    if !key_content.contains("ssh-") && !key_content.contains("ecdsa-") {
-        eprintln!("Warning: The file '{}' does not look like a public key.", pub_key_path.display());
+    if identity.content.trim().is_empty() {
+        bail!("Identity content is empty.");
     }
     
     // Clean up the key content (trim whitespace) to avoid issues with newlines
-    let clean_key_content = key_content.trim().to_string() + "\n";
+    let clean_key_content = identity.content.trim().to_string() + "\n";
 
     println!("Target: {}", args.destination);
 
-    // 3. Construct the remote command
+    // 2. Construct the remote command
     // We use a robust command sequence:
     // - umask 077: ensures created files are private
     // - mkdir -p .ssh && chmod 700 .ssh: ensures the dir exists with right perms
+    // - loop over stdin lines to handle multiple keys (e.g. from ssh-add -L)
     // - grep -qxF: checks if the exact key line already exists
     let remote_cmd = "umask 077; mkdir -p .ssh && chmod 700 .ssh; \
                       if [ ! -f .ssh/authorized_keys ]; then touch .ssh/authorized_keys && chmod 600 .ssh/authorized_keys; fi; \
-                      key=$(cat); \
-                      if ! grep -qxF \"$key\" .ssh/authorized_keys; then \
-                        echo \"$key\" >> .ssh/authorized_keys; \
-                      fi";
+                      while read -r key; do \
+                        if [ -n \"$key\" ]; then \
+                          if ! grep -qxF \"$key\" .ssh/authorized_keys; then \
+                            echo \"$key\" >> .ssh/authorized_keys; \
+                          fi; \
+                        fi; \
+                      done";
 
-    // 4. Execute SSH
+    // 3. Execute SSH
     let mut command = Command::new("ssh");
     
     if let Some(port) = args.port {
         command.arg("-p").arg(port);
     }
-
-    // Add verbose flag if you want to see ssh output, but standard ssh-copy-id is usually quiet-ish
-    // command.arg("-v");
 
     command
         .arg(&args.destination)
@@ -72,7 +76,7 @@ fn main() -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    println!("Executing: {:?}", command);
+    println!("Info: Attempting to log in with the new key(s) to filter out any that are already installed...");
 
     let mut child = command.spawn()
         .context("Failed to spawn ssh process. Make sure 'ssh' is in your PATH.")?;
@@ -86,7 +90,7 @@ fn main() -> Result<()> {
     let status = child.wait().context("Failed to wait on ssh process")?;
 
     if status.success() {
-        println!("\nNumber of key(s) added: 1");
+        println!("\nNumber of key(s) added: 1 (check output above if multiple)");
         println!("\nNow try logging into the machine, with:   \"ssh '{}'\"", args.destination);
         println!("and check to make sure that only the key(s) you wanted were added.");
     } else {
@@ -96,7 +100,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_identity_file(input: Option<String>) -> Result<PathBuf> {
+fn resolve_identity(input: Option<String>) -> Result<Identity> {
     if let Some(mut path_str) = input {
         // Expand ~ to home directory
         if path_str.starts_with("~/") || path_str.starts_with("~\\") {
@@ -104,50 +108,76 @@ fn resolve_identity_file(input: Option<String>) -> Result<PathBuf> {
             path_str = path_str.replacen('~', &home.to_string_lossy(), 1);
         }
 
-        // If the user provided a path, check if it's the public key or private key
         let path = PathBuf::from(&path_str);
-        if path.exists() {
-            // If it ends in .pub, assume it's the one we want
-            if path_str.ends_with(".pub") {
-                return Ok(path);
-            } 
-            // If it's the private key (no .pub), try to find the .pub counterpart
-            let pub_path = PathBuf::from(format!("{}.pub", path_str));
-            if pub_path.exists() {
-                return Ok(pub_path);
+        
+        // Logic to find .pub file if private key path given
+        let final_path = if path.exists() {
+             if path_str.ends_with(".pub") {
+                path
+            } else {
+                let pub_path = PathBuf::from(format!("{}.pub", path_str));
+                if pub_path.exists() {
+                    pub_path
+                } else {
+                    path // Fallback to original
+                }
             }
-            // Fallback: Use the file provided, maybe they named it non-standardly
-            return Ok(path);
         } else {
-            // If the user provided a file ending in .pub that doesn't exist, fail.
-            // If they provided a name like "id_rsa", try adding ".pub"
-            let pub_path = PathBuf::from(format!("{}.pub", path_str));
-            if pub_path.exists() {
-                return Ok(pub_path);
-            }
-             bail!("Identity file not found: {}", path_str);
-        }
+             // Try appending .pub
+             let pub_path = PathBuf::from(format!("{}.pub", path_str));
+             if pub_path.exists() {
+                 pub_path
+             } else {
+                 bail!("Identity file not found: {}", path_str);
+             }
+        };
+
+        let content = fs::read_to_string(&final_path)
+            .with_context(|| format!("Failed to read identity file: {:?}", final_path))?;
+            
+        Ok(Identity {
+            source: final_path.to_string_lossy().into_owned(),
+            content,
+        })
+
     } else {
         // Auto-discovery
         let home = dirs::home_dir().context("Could not determine home directory")?;
         let ssh_dir = home.join(".ssh");
 
-        // Priority list matches standard ssh behavior roughly
         let candidates = [
             "id_rsa.pub",
             "id_ed25519.pub",
             "id_ecdsa.pub",
             "id_dsa.pub",
-            "identity.pub", // Legacy
+            "identity.pub",
         ];
 
         for filename in candidates {
             let candidate = ssh_dir.join(filename);
             if candidate.exists() {
-                return Ok(candidate);
+                let content = fs::read_to_string(&candidate)
+                    .with_context(|| format!("Failed to read identity file: {:?}", candidate))?;
+                return Ok(Identity {
+                    source: candidate.to_string_lossy().into_owned(),
+                    content,
+                });
             }
         }
 
-        bail!("No identity file found in default locations. Please specify one with -i.");
+        // Try ssh-add -L
+        if let Ok(output) = Command::new("ssh-add").arg("-L").output() {
+            if output.status.success() {
+                let keys = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !keys.is_empty() && !keys.contains("The agent has no identities") {
+                     return Ok(Identity {
+                        source: "ssh-agent".to_string(),
+                        content: keys,
+                    });
+                }
+            }
+        }
+
+        bail!("No identity file found in default locations and no keys in ssh-agent. Please specify one with -i.");
     }
 }
